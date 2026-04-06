@@ -1,0 +1,41 @@
+{
+  "name": "hk-msin-scraper",
+  "version": "1.0.0",
+  "description": "Web scraper for Hong Kong Merchant Shipping Information Notes with OCR support",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "scraper",
+    "pdf",
+    "marine",
+    "shipping",
+    "ocr",
+    "hong-kong",
+    "puppeteer",
+    "tesseract"
+  ],
+  "author": "",
+  "license": "CC-BY-NC-4.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/hk-msin-scraper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/hk-msin-scraper/issues"
+  },
+  "homepage": "https://github.com/yourusername/hk-msin-scraper#readme",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {
+    "puppeteer": "^21.6.0",
+    "axios": "^1.6.2",
+    "pdf-parse": "^1.1.1",
+    "tesseract.js": "^5.0.4",
+    "pdf-lib": "^1.17.1",
+    "pdf-to-png-converter": "^3.3.0"
+  }
+}

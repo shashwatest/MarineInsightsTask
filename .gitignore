@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Output files
+msin_notices.json
+msin_notices_*.json
+
+# Temporary files
+temp_*
+page_*
+*.pdf
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
