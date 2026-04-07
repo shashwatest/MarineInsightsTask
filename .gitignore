@@ -1,10 +1,6 @@
 # Dependencies
 node_modules/
 
-# Output files
-msin_notices.json
-msin_notices_*.json
-
 # Temporary files
 temp_*
 page_*

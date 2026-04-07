@@ -4,6 +4,7 @@
  * Hong Kong Merchant Shipping Information Notes Scraper (JavaScript/Node.js)
  * Extracts structured data from MSIN notices and their PDFs
  * Includes OCR support for scanned/image-based PDFs
+ * Includes table extraction from PDFs
  */
 
 const puppeteer = require('puppeteer');
@@ -16,12 +17,184 @@ const { createWorker } = require('tesseract.js');
 const { PDFDocument } = require('pdf-lib');
 const { pdfToPng } = require('pdf-to-png-converter');
 
+// Note: pdf-table-extractor is not compatible with modern Node.js (canvas issues)
+// We rely on text-based table detection instead
+
 class MSINScraper {
-    constructor(baseUrl) {
+    constructor(baseUrl, options = {}) {
         this.baseUrl = baseUrl;
         this.failedPdfs = [];
         this.browser = null;
         this.page = null;
+        this.pdfDir = path.join(process.cwd(), 'pdfs');
+        this.stateFile = path.join(process.cwd(), '.scraper_state.json');
+        
+        // Configuration options with defaults
+        this.options = {
+            concurrency: options.concurrency || 1,        // Sequential by default (safest)
+            rateLimit: options.rateLimit || 1000,         // 1 second between requests
+            incremental: options.incremental !== false,   // Skip already downloaded
+            verbose: options.verbose || false,            // Detailed logging
+            quiet: options.quiet || false,                // Minimal logging
+            ...options
+        };
+        
+        // Request queue for proper rate limiting
+        this.requestQueue = [];
+        this.activeRequests = 0;
+        this.lastRequestTime = 0;
+        
+        // State save throttling
+        this.stateSaveTimeout = null;
+        this.pendingState = null;
+    }
+    
+    log(message, level = 'info') {
+        if (this.options.quiet && level !== 'error') return;
+        if (level === 'debug' && !this.options.verbose) return;
+        console.log(message);
+    }
+    
+    async ensurePdfDirectory() {
+        try {
+            await fs.access(this.pdfDir);
+        } catch {
+            await fs.mkdir(this.pdfDir, { recursive: true });
+            this.log(`Created PDF directory: ${this.pdfDir}`);
+        }
+    }
+    
+    // Progress persistence methods
+    async loadState() {
+        try {
+            const data = await fs.readFile(this.stateFile, 'utf8');
+            return JSON.parse(data);
+        } catch {
+            return { processedNotices: {}, lastRun: null };
+        }
+    }
+    
+    // Throttled state save - prevents write contention
+    async saveStateThrottled(state) {
+        this.pendingState = state;
+        
+        if (this.stateSaveTimeout) {
+            return; // Already scheduled
+        }
+        
+        this.stateSaveTimeout = setTimeout(async () => {
+            this.stateSaveTimeout = null;
+            if (this.pendingState) {
+                await fs.writeFile(this.stateFile, JSON.stringify(this.pendingState, null, 2), 'utf8');
+            }
+        }, 1000); // Save at most once per second
+    }
+    
+    // Immediate state save (for final save)
+    async saveState(state) {
+        if (this.stateSaveTimeout) {
+            clearTimeout(this.stateSaveTimeout);
+            this.stateSaveTimeout = null;
+        }
+        await fs.writeFile(this.stateFile, JSON.stringify(state, null, 2), 'utf8');
+    }
+    
+    async clearState() {
+        try {
+            await fs.unlink(this.stateFile);
+        } catch {
+            // File doesn't exist, that's fine
+        }
+    }
+    
+    // Check if a notice was already processed
+    isNoticeProcessed(state, noticeNumber) {
+        return state.processedNotices[noticeNumber] && 
+               state.processedNotices[noticeNumber].status === 'done';
+    }
+    
+    // Proper rate limiting - ensures minimum gap between ANY requests
+    async waitForRateLimit() {
+        const now = Date.now();
+        const timeSinceLastRequest = now - this.lastRequestTime;
+        const waitTime = Math.max(0, this.options.rateLimit - timeSinceLastRequest);
+        
+        if (waitTime > 0) {
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+        
+        this.lastRequestTime = Date.now();
+    }
+    
+    // Process items with proper concurrency control
+    async processWithConcurrency(items, processFn) {
+        const results = new Array(items.length);
+        let currentIndex = 0;
+        let completedCount = 0;
+        
+        const worker = async (workerId) => {
+            while (currentIndex < items.length) {
+                const index = currentIndex++;
+                const item = items[index];
+                
+                try {
+                    results[index] = await processFn(item, index);
+                } catch (error) {
+                    this.log(`  Worker ${workerId} error on item ${index}: ${error.message}`, 'error');
+                    results[index] = null;
+                }
+                
+                completedCount++;
+            }
+        };
+        
+        // Start workers up to concurrency limit
+        const workers = [];
+        const workerCount = Math.min(this.options.concurrency, items.length);
+        
+        for (let i = 0; i < workerCount; i++) {
+            workers.push(worker(i + 1));
+        }
+        
+        await Promise.all(workers);
+        
+        return results;
+    }
+    
+    generatePdfFilename(noticeNumber, lang = 'en') {
+        // Convert "MSIN No. 04/2024" to "msin_04_2024_en.pdf"
+        const match = noticeNumber.match(/(\d+)\/(\d{4})/);
+        if (match) {
+            const num = match[1].padStart(2, '0');
+            const year = match[2];
+            return `msin_${num}_${year}_${lang}.pdf`;
+        }
+        // Fallback: sanitize the notice number
+        const sanitized = noticeNumber.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+        return `${sanitized}_${lang}.pdf`;
+    }
+    
+    async savePdfLocally(pdfBuffer, filename) {
+        const localPath = path.join(this.pdfDir, filename);
+        await fs.writeFile(localPath, pdfBuffer);
+        return localPath;
+    }
+    
+    getChinesePdfUrl(englishPdfUrl) {
+        // Pattern: msin2024004e.pdf -> msin2024004c.pdf
+        // Or: /en/ -> /tc/ in path
+        let chineseUrl = englishPdfUrl;
+        
+        // Try replacing 'e.pdf' with 'c.pdf' at the end
+        if (/e\.pdf$/i.test(englishPdfUrl)) {
+            chineseUrl = englishPdfUrl.replace(/e\.pdf$/i, 'c.pdf');
+        }
+        // Also try replacing /en/ with /tc/ in path
+        else if (englishPdfUrl.includes('/en/')) {
+            chineseUrl = englishPdfUrl.replace('/en/', '/tc/');
+        }
+        
+        return chineseUrl !== englishPdfUrl ? chineseUrl : null;
     }
 
     async initBrowser() {
@@ -183,39 +356,83 @@ class MSINScraper {
             }
             
             console.log(`Found ${notices.length} total notices across ${pageNum} pages`);
-            return notices;
+            
+            // Deduplicate by notice number (some notices might appear on multiple pages)
+            const uniqueNotices = [];
+            const seenNumbers = new Set();
+            for (const notice of notices) {
+                if (!seenNumbers.has(notice.noticeNumber)) {
+                    seenNumbers.add(notice.noticeNumber);
+                    uniqueNotices.push(notice);
+                }
+            }
+            
+            if (uniqueNotices.length < notices.length) {
+                console.log(`Deduplicated to ${uniqueNotices.length} unique notices`);
+            }
+            
+            return uniqueNotices;
             
         } finally {
             await this.closeBrowser();
         }
     }
 
-    async downloadAndParsePdf(pdfUrl) {
+    async downloadWithRetry(url, maxRetries = 3) {
+        let lastError;
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                // Wait for rate limit before each request (including retries)
+                await this.waitForRateLimit();
+                
+                const response = await axios.get(url, {
+                    responseType: 'arraybuffer',
+                    timeout: 30000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    },
+                    maxContentLength: 50 * 1024 * 1024,
+                    validateStatus: (status) => status === 200
+                });
+                
+                if (!response.data || response.data.byteLength === 0) {
+                    throw new Error('Empty PDF response');
+                }
+                
+                return response;
+            } catch (error) {
+                lastError = error;
+                
+                // Don't retry on permanent errors (4xx status codes)
+                const status = error.response?.status;
+                if (status && status >= 400 && status < 500) {
+                    this.log(`  Permanent error (HTTP ${status}), not retrying`, 'debug');
+                    throw error;
+                }
+                
+                if (attempt < maxRetries) {
+                    // Exponential backoff: 2s, 4s, 8s (longer delays to let server recover)
+                    const delay = Math.pow(2, attempt) * 1000;
+                    this.log(`  Retry ${attempt}/${maxRetries} failed (${error.message}), waiting ${delay / 1000}s...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+        
+        throw lastError;
+    }
+
+    async downloadAndParsePdf(pdfUrl, options = {}) {
         let worker = null;
+        const { silent = false } = options; // Don't log errors or track failures when silent
         
         try {
-            console.log(`Downloading PDF: ${pdfUrl}`);
+            this.log(`Downloading PDF: ${pdfUrl}`, 'debug');
             
-            const response = await axios.get(pdfUrl, {
-                responseType: 'arraybuffer',
-                timeout: 30000,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                },
-                maxContentLength: 50 * 1024 * 1024,
-                validateStatus: (status) => status === 200
-            });
-            
-            if (!response.data || response.data.byteLength === 0) {
-                throw new Error('Empty PDF response');
-            }
-            
+            const response = await this.downloadWithRetry(pdfUrl);
             const pdfBuffer = Buffer.from(response.data);
             const data = await pdf(pdfBuffer);
-            
-            if (!data || !data.text) {
-                throw new Error('PDF parsing returned no text');
-            }
             
             const pageCount = data.numpages || 0;
             let fullText = this.cleanText(data.text);
@@ -313,6 +530,18 @@ class MSINScraper {
             const effectiveDate = this.extractEffectiveDate(fullText);
             const summary = this.extractSummary(fullText);
             
+            // Extract tables from PDF text
+            let tables = [];
+            try {
+                tables = await this.extractTablesFromPdf(pdfBuffer, fullText);
+                
+                if (tables.length > 0) {
+                    this.log(`  ✓ Extracted ${tables.length} table(s)`, 'debug');
+                }
+            } catch (tableError) {
+                this.log(`  Table extraction failed: ${tableError.message}`, 'debug');
+            }
+            
             return {
                 pageCount,
                 pages,
@@ -320,12 +549,16 @@ class MSINScraper {
                 subject,
                 issuedBy,
                 effectiveDate,
-                summary
+                summary,
+                tables,
+                pdfBuffer // Include buffer for local saving
             };
             
         } catch (error) {
-            console.error(`ERROR: Failed to process PDF ${pdfUrl}: ${error.message}`);
-            this.failedPdfs.push({ url: pdfUrl, error: error.message });
+            if (!silent) {
+                console.error(`ERROR: Failed to process PDF ${pdfUrl}: ${error.message}`);
+                this.failedPdfs.push({ url: pdfUrl, error: error.message });
+            }
             return null;
         } finally {
             // Clean up Tesseract worker
@@ -774,6 +1007,47 @@ class MSINScraper {
             return summary.trim();
         }
         
+        // Fallback: extract first 500-1000 characters of body text
+        // Skip header lines and metadata to find actual content
+        const bodyLines = [];
+        let foundContent = false;
+        
+        for (const line of lines) {
+            const lineStripped = line.trim();
+            if (!lineStripped) continue;
+            
+            // Skip common header/metadata patterns
+            if (/^(HONG KONG MERCHANT SHIPPING|香港商船資訊|MSIN No\.|No\.\s*:|To\s*:|Marine Department|Harbour Building)/i.test(lineStripped)) {
+                continue;
+            }
+            
+            // Start capturing after we see numbered sections or substantive content
+            if (/^[1-9]\./.test(lineStripped) || lineStripped.length > 50) {
+                foundContent = true;
+            }
+            
+            if (foundContent) {
+                bodyLines.push(lineStripped);
+            }
+        }
+        
+        if (bodyLines.length > 0) {
+            const bodyText = bodyLines.join(' ');
+            // Return 500-1000 characters, trying to end at a sentence boundary
+            if (bodyText.length <= 1000) {
+                return bodyText;
+            }
+            
+            // Find a good break point between 500-1000 chars
+            let endPos = 1000;
+            const sentenceEnd = bodyText.lastIndexOf('.', 1000);
+            if (sentenceEnd > 500) {
+                endPos = sentenceEnd + 1;
+            }
+            
+            return bodyText.slice(0, endPos).trim();
+        }
+        
         return 'Not specified';
     }
 
@@ -801,22 +1075,202 @@ class MSINScraper {
         return attachments;
     }
 
-    async scrapeAll(filterYear = null) {
-        console.log('Starting MSIN scraper...');
-        if (filterYear) {
-            console.log(`Filtering notices for year: ${filterYear}`);
+    // Extract tables from PDF text using pattern matching
+    // Note: pdf-table-extractor library is not compatible with modern Node.js
+    async extractTablesFromPdf(pdfBuffer, pdfText) {
+        // Use text-based table detection
+        return this.extractTablesFromText(pdfText || '');
+    }
+    
+    // Format extracted table data into structured output
+    formatExtractedTable(tableData, pageNum, tableNum) {
+        if (!tableData || tableData.length === 0) {
+            return null;
         }
-        console.log('='.repeat(60));
+        
+        // Filter out empty rows
+        const rows = tableData.filter(row => {
+            if (!row || !Array.isArray(row)) return false;
+            return row.some(cell => cell && cell.toString().trim().length > 0);
+        });
+        
+        if (rows.length === 0) {
+            return null;
+        }
+        
+        // Try to detect header row (first row often contains headers)
+        const headerRow = rows[0];
+        const dataRows = rows.slice(1);
+        
+        // Clean cell values
+        const cleanCell = (cell) => {
+            if (cell === null || cell === undefined) return '';
+            return cell.toString().trim().replace(/\s+/g, ' ');
+        };
+        
+        const headers = headerRow.map(cleanCell);
+        
+        // Build table structure
+        const table = {
+            page: pageNum,
+            table_number: tableNum,
+            headers: headers,
+            rows: dataRows.map(row => row.map(cleanCell)),
+            row_count: dataRows.length,
+            column_count: headers.length
+        };
+        
+        // Only return tables with meaningful content
+        if (table.row_count === 0 || table.column_count === 0) {
+            return null;
+        }
+        
+        // Additional: create a "records" format for easier consumption
+        // Each row becomes an object with header keys
+        if (headers.every(h => h.length > 0)) {
+            table.records = dataRows.map(row => {
+                const record = {};
+                headers.forEach((header, idx) => {
+                    record[header] = cleanCell(row[idx] || '');
+                });
+                return record;
+            });
+        }
+        
+        return table;
+    }
+    
+    // Fallback: Extract tables from text using pattern matching (for OCR'd text)
+    extractTablesFromText(text) {
+        const tables = [];
+        
+        // Look for table-like patterns in the text
+        // Tables often have:
+        // - Lines with multiple tab/space-separated columns
+        // - Consistent column alignment
+        // - Header rows followed by data rows
+        
+        const lines = text.split('\n');
+        let currentTable = null;
+        let tableStartIdx = 0;
+        
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            
+            // Skip empty lines
+            if (!line) {
+                // End current table if we have one
+                if (currentTable && currentTable.rows.length > 1) {
+                    tables.push(this.finalizeTextTable(currentTable, tableStartIdx));
+                }
+                currentTable = null;
+                continue;
+            }
+            
+            // Check if line looks like a table row (multiple columns separated by 2+ spaces or tabs)
+            const columns = line.split(/\s{2,}|\t+/).filter(c => c.trim().length > 0);
+            
+            if (columns.length >= 2) {
+                if (!currentTable) {
+                    // Start a new table
+                    currentTable = {
+                        headers: columns,
+                        rows: [],
+                        columnCount: columns.length
+                    };
+                    tableStartIdx = i;
+                } else {
+                    // Add row to current table if column count is similar (within 1)
+                    if (Math.abs(columns.length - currentTable.columnCount) <= 1) {
+                        // Normalize column count
+                        while (columns.length < currentTable.columnCount) {
+                            columns.push('');
+                        }
+                        currentTable.rows.push(columns.slice(0, currentTable.columnCount));
+                    } else {
+                        // Column count mismatch - end current table and start new one
+                        if (currentTable.rows.length > 0) {
+                            tables.push(this.finalizeTextTable(currentTable, tableStartIdx));
+                        }
+                        currentTable = {
+                            headers: columns,
+                            rows: [],
+                            columnCount: columns.length
+                        };
+                        tableStartIdx = i;
+                    }
+                }
+            } else {
+                // Not a table row - end current table
+                if (currentTable && currentTable.rows.length > 0) {
+                    tables.push(this.finalizeTextTable(currentTable, tableStartIdx));
+                }
+                currentTable = null;
+            }
+        }
+        
+        // Don't forget the last table
+        if (currentTable && currentTable.rows.length > 0) {
+            tables.push(this.finalizeTextTable(currentTable, tableStartIdx));
+        }
+        
+        return tables;
+    }
+    
+    finalizeTextTable(tableData, startLine) {
+        const table = {
+            page: null, // Can't determine page from text
+            table_number: null,
+            headers: tableData.headers,
+            rows: tableData.rows,
+            row_count: tableData.rows.length,
+            column_count: tableData.columnCount,
+            source: 'text_extraction',
+            start_line: startLine
+        };
+        
+        // Create records if headers look valid
+        if (tableData.headers.every(h => h.length > 0 && h.length < 50)) {
+            table.records = tableData.rows.map(row => {
+                const record = {};
+                tableData.headers.forEach((header, idx) => {
+                    record[header] = row[idx] || '';
+                });
+                return record;
+            });
+        }
+        
+        return table;
+    }
+
+    async scrapeAll(filterYear = null) {
+        this.log('Starting MSIN scraper...');
+        if (filterYear) {
+            this.log(`Filtering notices for year: ${filterYear}`);
+        }
+        if (this.options.incremental) {
+            this.log('Incremental mode: will skip already-processed notices');
+        }
+        this.log(`Concurrency: ${this.options.concurrency} parallel downloads`);
+        this.log(`Rate limit: ${this.options.rateLimit}ms between requests`);
+        this.log('='.repeat(60));
         
         // Clean up any leftover temp files from previous runs
         await this.cleanupTempFiles();
+        
+        // Ensure PDF directory exists for local storage
+        await this.ensurePdfDirectory();
+        
+        // Load previous state for incremental scraping
+        let state = await this.loadState();
+        const startTime = Date.now();
         
         try {
             // Step 1: Scrape index page
             const indexNotices = await this.scrapeIndexPage();
             
             if (!indexNotices || indexNotices.length === 0) {
-                console.error('ERROR: No notices found on index page');
+                this.log('ERROR: No notices found on index page', 'error');
                 return null;
             }
             
@@ -833,10 +1287,10 @@ class MSINScraper {
                     return false;
                 });
                 
-                console.log(`\nFiltered ${filteredNotices.length} notices for year ${filterYear} (out of ${indexNotices.length} total)`);
+                this.log(`\nFiltered ${filteredNotices.length} notices for year ${filterYear} (out of ${indexNotices.length} total)`);
                 
                 if (filteredNotices.length === 0) {
-                    console.log(`\nNo notices found for year ${filterYear}`);
+                    this.log(`\nNo notices found for year ${filterYear}`);
                     return {
                         source_url: this.baseUrl,
                         scraped_at: new Date().toISOString(),
@@ -847,44 +1301,147 @@ class MSINScraper {
                 }
             }
             
-            console.log(`\nProcessing ${filteredNotices.length} PDFs...`);
-            console.log('='.repeat(60));
+            // Separate notices into already-processed and to-process
+            let noticesToProcess = filteredNotices;
+            let skippedNotices = [];
             
-            // Step 2: Process each PDF
+            if (this.options.incremental) {
+                noticesToProcess = filteredNotices.filter(n => !this.isNoticeProcessed(state, n.noticeNumber));
+                skippedNotices = filteredNotices.filter(n => this.isNoticeProcessed(state, n.noticeNumber));
+                
+                if (skippedNotices.length > 0) {
+                    this.log(`\n✓ Skipping ${skippedNotices.length} already-processed notices`);
+                }
+            }
+            
+            this.log(`\nProcessing ${noticesToProcess.length} PDFs...`);
+            this.log('='.repeat(60));
+            
+            // Step 2: Process notices (with parallel downloads)
             const allNotices = [];
-            for (let idx = 0; idx < filteredNotices.length; idx++) {
-                const notice = filteredNotices[idx];
-                console.log(`\n[${idx + 1}/${filteredNotices.length}] Processing: ${notice.noticeNumber}`);
+            
+            // First, add back the skipped notices from previous state
+            for (const notice of skippedNotices) {
+                const cached = state.processedNotices[notice.noticeNumber];
+                if (cached && cached.data) {
+                    allNotices.push(cached.data);
+                    this.log(`  [cached] ${notice.noticeNumber}`, 'debug');
+                }
+            }
+            
+            // Process new notices in parallel batches
+            const totalToProcess = noticesToProcess.length;
+            let processedCount = 0;
+            
+            const processNotice = async (notice, idx) => {
+                const globalIdx = skippedNotices.length + idx + 1;
+                processedCount++;
+                this.log(`\n[${processedCount}/${totalToProcess}] Processing: ${notice.noticeNumber}`);
                 
                 try {
-                    const pdfData = await this.downloadAndParsePdf(notice.pdfUrl);
+                    // Process English version
+                    const enPdfData = await this.downloadAndParsePdf(notice.pdfUrl);
                     
-                    if (pdfData) {
+                    // Try to get Chinese version
+                    const cnPdfUrl = this.getChinesePdfUrl(notice.pdfUrl);
+                    let cnPdfData = null;
+                    
+                    if (cnPdfUrl) {
+                        this.log(`  Checking for Chinese version...`, 'debug');
+                        try {
+                            // Use silent mode - Chinese versions often don't exist for older notices
+                            cnPdfData = await this.downloadAndParsePdf(cnPdfUrl, { silent: true });
+                            if (cnPdfData) {
+                                this.log(`  ✓ Chinese version found`);
+                            }
+                        } catch (cnError) {
+                            // Chinese version not available - this is normal
+                            this.log(`  Chinese version not available`, 'debug');
+                        }
+                    }
+                    
+                    if (enPdfData) {
+                        // Save English PDF locally
+                        const enFilename = this.generatePdfFilename(notice.noticeNumber, 'en');
+                        const enLocalPath = await this.savePdfLocally(enPdfData.pdfBuffer, enFilename);
+                        this.log(`  ✓ Saved: ${enFilename}`);
+                        
+                        // Build languages array
+                        const languages = [{
+                            lang: 'en',
+                            pdf_url: notice.pdfUrl,
+                            local_path: enLocalPath,
+                            page_count: enPdfData.pageCount,
+                            subject: enPdfData.subject,
+                            issued_by: enPdfData.issuedBy,
+                            effective_date: enPdfData.effectiveDate,
+                            summary: enPdfData.summary,
+                            pages: enPdfData.pages,
+                            full_text: enPdfData.fullText,
+                            tables: enPdfData.tables || []
+                        }];
+                        
+                        // Add Chinese version if available
+                        if (cnPdfData && cnPdfUrl) {
+                            const cnFilename = this.generatePdfFilename(notice.noticeNumber, 'cn');
+                            const cnLocalPath = await this.savePdfLocally(cnPdfData.pdfBuffer, cnFilename);
+                            this.log(`  ✓ Saved: ${cnFilename}`);
+                            
+                            languages.push({
+                                lang: 'cn',
+                                pdf_url: cnPdfUrl,
+                                local_path: cnLocalPath,
+                                page_count: cnPdfData.pageCount,
+                                subject: cnPdfData.subject,
+                                issued_by: cnPdfData.issuedBy,
+                                effective_date: cnPdfData.effectiveDate,
+                                summary: cnPdfData.summary,
+                                pages: cnPdfData.pages,
+                                full_text: cnPdfData.fullText,
+                                tables: cnPdfData.tables || []
+                            });
+                        }
+                        
                         // Merge index data with PDF data
                         const completeNotice = {
-                            id: idx + 1,
+                            id: globalIdx,
                             notice_number: notice.noticeNumber,
                             title: notice.title,
                             issue_date: notice.issueDate,
+                            // Keep original fields for backward compatibility (from English version)
                             pdf_url: notice.pdfUrl,
-                            page_count: pdfData.pageCount,
-                            subject: pdfData.subject,
-                            issued_by: pdfData.issuedBy,
-                            effective_date: pdfData.effectiveDate,
-                            summary: pdfData.summary,
-                            pages: pdfData.pages,
-                            full_text: pdfData.fullText,
-                            attachments: notice.attachmentsFromWeb || []
+                            local_path: enLocalPath,
+                            page_count: enPdfData.pageCount,
+                            subject: enPdfData.subject,
+                            issued_by: enPdfData.issuedBy,
+                            effective_date: enPdfData.effectiveDate,
+                            summary: enPdfData.summary,
+                            pages: enPdfData.pages,
+                            full_text: enPdfData.fullText,
+                            tables: enPdfData.tables || [],
+                            attachments: notice.attachmentsFromWeb || [],
+                            // New: languages array with both versions
+                            languages: languages
                         };
-                        allNotices.push(completeNotice);
+                        
+                        // Save to state for incremental scraping
+                        state.processedNotices[notice.noticeNumber] = {
+                            status: 'done',
+                            processedAt: new Date().toISOString(),
+                            data: completeNotice
+                        };
+                        await this.saveStateThrottled(state);
+                        
+                        return completeNotice;
                     } else {
                         // Add placeholder for failed PDF
                         const completeNotice = {
-                            id: idx + 1,
+                            id: globalIdx,
                             notice_number: notice.noticeNumber,
                             title: notice.title,
                             issue_date: notice.issueDate,
                             pdf_url: notice.pdfUrl,
+                            local_path: null,
                             page_count: 0,
                             subject: 'PDF extraction failed - manual review required',
                             issued_by: 'Not specified',
@@ -892,19 +1449,31 @@ class MSINScraper {
                             summary: 'PDF extraction failed - manual review required',
                             pages: [],
                             full_text: 'PDF extraction failed - manual review required',
-                            attachments: notice.attachmentsFromWeb || []
+                            tables: [],
+                            attachments: notice.attachmentsFromWeb || [],
+                            languages: []
                         };
-                        allNotices.push(completeNotice);
+                        
+                        // Mark as failed in state (so we retry next time)
+                        state.processedNotices[notice.noticeNumber] = {
+                            status: 'failed',
+                            processedAt: new Date().toISOString(),
+                            error: 'PDF extraction failed'
+                        };
+                        await this.saveStateThrottled(state);
+                        
+                        return completeNotice;
                     }
                 } catch (error) {
-                    console.error(`  Error processing notice ${idx + 1}: ${error.message}`);
+                    this.log(`  Error processing notice: ${error.message}`, 'error');
                     // Add placeholder for error
                     const completeNotice = {
-                        id: idx + 1,
+                        id: globalIdx,
                         notice_number: notice.noticeNumber,
                         title: notice.title,
                         issue_date: notice.issueDate,
                         pdf_url: notice.pdfUrl,
+                        local_path: null,
                         page_count: 0,
                         subject: 'PDF extraction failed - manual review required',
                         issued_by: 'Not specified',
@@ -912,18 +1481,67 @@ class MSINScraper {
                         summary: 'PDF extraction failed - manual review required',
                         pages: [],
                         full_text: 'PDF extraction failed - manual review required',
-                        attachments: notice.attachmentsFromWeb || []
+                        tables: [],
+                        attachments: notice.attachmentsFromWeb || [],
+                        languages: []
                     };
-                    allNotices.push(completeNotice);
+                    
+                    // Mark as failed in state
+                    state.processedNotices[notice.noticeNumber] = {
+                        status: 'failed',
+                        processedAt: new Date().toISOString(),
+                        error: error.message
+                    };
+                    await this.saveStateThrottled(state);
+                    
+                    return completeNotice;
+                }
+            };
+            
+            // Process with proper concurrency control
+            const newNotices = await this.processWithConcurrency(noticesToProcess, processNotice);
+            allNotices.push(...newNotices.filter(n => n !== null));
+            
+            // Final state save (immediate, not throttled)
+            await this.saveState(state);
+            
+            // Deduplicate by notice_number (safety check)
+            const uniqueNoticesMap = new Map();
+            for (const notice of allNotices) {
+                if (!uniqueNoticesMap.has(notice.notice_number)) {
+                    uniqueNoticesMap.set(notice.notice_number, notice);
                 }
             }
+            const uniqueNotices = Array.from(uniqueNoticesMap.values());
+            
+            if (uniqueNotices.length < allNotices.length) {
+                this.log(`  Removed ${allNotices.length - uniqueNotices.length} duplicate entries`);
+            }
+            
+            // Sort by ID to maintain order
+            uniqueNotices.sort((a, b) => {
+                // Extract year and number from notice_number for proper sorting
+                const parseNotice = (n) => {
+                    const match = n.notice_number.match(/(\d+)\/(\d{4})/);
+                    return match ? { num: parseInt(match[1]), year: parseInt(match[2]) } : { num: 0, year: 0 };
+                };
+                const aParsed = parseNotice(a);
+                const bParsed = parseNotice(b);
+                if (aParsed.year !== bParsed.year) return bParsed.year - aParsed.year;
+                return bParsed.num - aParsed.num;
+            });
+            
+            // Reassign IDs after sorting
+            uniqueNotices.forEach((notice, idx) => {
+                notice.id = idx + 1;
+            });
             
             // Step 3: Create final output structure
             const output = {
                 source_url: this.baseUrl,
                 scraped_at: new Date().toISOString(),
-                total_notices: allNotices.length,
-                notices: allNotices
+                total_notices: uniqueNotices.length,
+                notices: uniqueNotices
             };
             
             // Add filter_year to output if filtering was applied
@@ -931,9 +1549,20 @@ class MSINScraper {
                 output.filter_year = filterYear;
             }
             
+            // Update state with completion info
+            state.lastRun = {
+                completedAt: new Date().toISOString(),
+                totalProcessed: uniqueNotices.length,
+                duration: Math.round((Date.now() - startTime) / 1000)
+            };
+            await this.saveState(state);
+            
+            const duration = Math.round((Date.now() - startTime) / 1000);
+            this.log(`\nCompleted in ${duration} seconds`);
+            
             return output;
         } catch (error) {
-            console.error('Fatal error in scrapeAll:', error.message);
+            this.log(`Fatal error in scrapeAll: ${error.message}`, 'error');
             throw error;
         }
     }
@@ -958,36 +1587,77 @@ async function main() {
     // Parse command line arguments
     const args = process.argv.slice(2);
     let filterYear = null;
+    const options = {};
     
-    // Look for --year flag
+    // Parse all flags
     for (let i = 0; i < args.length; i++) {
-        if (args[i] === '--year' && args[i + 1]) {
+        const arg = args[i];
+        
+        if (arg === '--year' && args[i + 1]) {
             filterYear = parseInt(args[i + 1]);
             if (isNaN(filterYear) || filterYear < 1900 || filterYear > 2100) {
                 console.error('Error: Invalid year. Please provide a valid year (e.g., --year 2024)');
                 process.exit(1);
             }
-            break;
+            i++; // Skip next arg
+        } else if (arg === '--concurrency' && args[i + 1]) {
+            options.concurrency = parseInt(args[i + 1]);
+            if (isNaN(options.concurrency) || options.concurrency < 1 || options.concurrency > 10) {
+                console.error('Error: Concurrency must be between 1 and 10');
+                process.exit(1);
+            }
+            i++;
+        } else if (arg === '--rate-limit' && args[i + 1]) {
+            options.rateLimit = parseInt(args[i + 1]);
+            if (isNaN(options.rateLimit) || options.rateLimit < 0) {
+                console.error('Error: Rate limit must be a positive number (milliseconds)');
+                process.exit(1);
+            }
+            i++;
+        } else if (arg === '--no-incremental') {
+            options.incremental = false;
+        } else if (arg === '--fresh') {
+            options.incremental = false;
+            options.clearState = true;
+        } else if (arg === '--verbose' || arg === '-v') {
+            options.verbose = true;
+        } else if (arg === '--quiet' || arg === '-q') {
+            options.quiet = true;
         }
     }
     
     // Show usage if --help is provided
     if (args.includes('--help') || args.includes('-h')) {
-        console.log('Usage: node scraper.js [--year YYYY]');
+        console.log('Usage: node scraper.js [options]');
         console.log('');
         console.log('Options:');
-        console.log('  --year YYYY    Filter notices by year (e.g., --year 2024)');
-        console.log('  --help, -h     Show this help message');
+        console.log('  --year YYYY        Filter notices by year (e.g., --year 2024)');
+        console.log('  --concurrency N    Number of parallel downloads (1-10, default: 1)');
+        console.log('  --rate-limit MS    Delay between requests in ms (default: 1000)');
+        console.log('  --no-incremental   Re-download all notices (ignore cache)');
+        console.log('  --fresh            Clear state and start fresh');
+        console.log('  --verbose, -v      Show detailed progress');
+        console.log('  --quiet, -q        Minimal output');
+        console.log('  --help, -h         Show this help message');
         console.log('');
         console.log('Examples:');
-        console.log('  node scraper.js              # Scrape all notices');
-        console.log('  node scraper.js --year 2024  # Scrape only 2024 notices');
+        console.log('  node scraper.js                        # Scrape all (incremental, sequential)');
+        console.log('  node scraper.js --year 2024            # Scrape only 2024 notices');
+        console.log('  node scraper.js --concurrency 3        # Use 3 parallel downloads');
+        console.log('  node scraper.js --fresh                # Clear cache, start fresh');
+        console.log('  node scraper.js --verbose              # Show detailed progress');
         process.exit(0);
     }
     
     const url = 'https://www.mardep.gov.hk/en/legislation/notices/msin/index.html';
     
-    const scraper = new MSINScraper(url);
+    const scraper = new MSINScraper(url, options);
+    
+    // Clear state if --fresh flag is used
+    if (options.clearState) {
+        await scraper.clearState();
+        console.log('✓ State cleared - starting fresh');
+    }
     
     try {
         const data = await scraper.scrapeAll(filterYear);

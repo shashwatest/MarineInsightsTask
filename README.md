@@ -11,6 +11,15 @@ Web scraper that extracts structured data from Hong Kong Marine Department's MSI
 - ✅ Year filter to scrape specific years only
 - ✅ Comprehensive error handling and logging
 - ✅ Automatic cleanup of temporary files
+- ✅ **Retry mechanism** for failed PDF downloads (3 retries with exponential backoff)
+- ✅ **Local PDF storage** in `/pdfs` folder with `local_path` references
+- ✅ **EN/CN language linking** - both versions under one notice with `languages` array
+- ✅ **Table extraction** - detects and extracts tables from PDFs as structured data
+- ✅ **Incremental scraping** - skip already-downloaded notices on re-runs
+- ✅ **Progress persistence** - resume from where you left off after interruption
+- ✅ **Parallel downloads** - configurable concurrency (1-10, default: 1)
+- ✅ **Rate limiting** - configurable delay between requests (default: 1000ms)
+- ✅ **Verbose/Quiet modes** - control logging verbosity
 
 ## Installation
 
@@ -26,10 +35,11 @@ This will install:
 - `tesseract.js` - OCR (no additional installation needed!)
 - `pdf-lib` - PDF manipulation
 - `pdf-to-png-converter` - PDF to image conversion
+- `pdf-table-extractor` - Table extraction from PDFs
 
 ## Usage
 
-### Scrape all notices
+### Scrape all notices (incremental)
 ```bash
 node scraper.js
 # or
@@ -39,8 +49,28 @@ npm start
 ### Filter by year
 ```bash
 node scraper.js --year 2024
-# or
-node scraper.js --year 2025
+```
+
+### Parallel downloads (faster)
+```bash
+node scraper.js --concurrency 3    # Use 3 parallel downloads (default: 1 - sequential)
+```
+
+### Rate limiting
+```bash
+node scraper.js --rate-limit 2000  # 2 seconds between requests (default: 1000ms)
+```
+
+### Fresh start (ignore cache)
+```bash
+node scraper.js --fresh            # Clear state and re-download everything
+node scraper.js --no-incremental   # Re-download but keep state file
+```
+
+### Verbose/Quiet mode
+```bash
+node scraper.js --verbose          # Show detailed progress
+node scraper.js --quiet            # Minimal output
 ```
 
 ### Show help
@@ -58,6 +88,8 @@ The script generates `msin_notices.json` containing:
 - Structured fields including subject, issued_by, effective_date, etc.
 - Page-by-page breakdown of PDF content
 - Attachments with names and URLs
+- Local PDF file paths (stored in `/pdfs` folder)
+- Multi-language support with `languages` array (EN + CN versions linked)
 
 ### Output Format
 
@@ -73,6 +105,7 @@ The script generates `msin_notices.json` containing:
       "title": "Survey Guidelines under the Harmonized System...",
       "issue_date": "2026-02-11",
       "pdf_url": "https://www.mardep.gov.hk/filemanager/...",
+      "local_path": "C:/path/to/pdfs/msin_03_2026_en.pdf",
       "page_count": 1,
       "subject": "Survey Guidelines under the Harmonized System...",
       "issued_by": "Marine Department",
@@ -85,10 +118,49 @@ The script generates `msin_notices.json` containing:
         }
       ],
       "full_text": "Complete PDF text...",
+      "tables": [
+        {
+          "page": 1,
+          "table_number": 1,
+          "headers": ["Column A", "Column B", "Column C"],
+          "rows": [
+            ["Row 1 A", "Row 1 B", "Row 1 C"],
+            ["Row 2 A", "Row 2 B", "Row 2 C"]
+          ],
+          "row_count": 2,
+          "column_count": 3,
+          "records": [
+            {"Column A": "Row 1 A", "Column B": "Row 1 B", "Column C": "Row 1 C"},
+            {"Column A": "Row 2 A", "Column B": "Row 2 B", "Column C": "Row 2 C"}
+          ]
+        }
+      ],
       "attachments": [
         {
           "name": "Annex 1",
           "pdf_url": "https://www.mardep.gov.hk/filemanager/..."
+        }
+      ],
+      "languages": [
+        {
+          "lang": "en",
+          "pdf_url": "https://www.mardep.gov.hk/.../msin2026003e.pdf",
+          "local_path": "C:/path/to/pdfs/msin_03_2026_en.pdf",
+          "page_count": 1,
+          "subject": "Survey Guidelines...",
+          "summary": "The purpose of this Note...",
+          "full_text": "...",
+          "tables": [...]
+        },
+        {
+          "lang": "cn",
+          "pdf_url": "https://www.mardep.gov.hk/.../msin2026003c.pdf",
+          "local_path": "C:/path/to/pdfs/msin_03_2026_cn.pdf",
+          "page_count": 1,
+          "subject": "調查指引...",
+          "summary": "本資訊之目的...",
+          "full_text": "...",
+          "tables": [...]
         }
       ]
     }
@@ -130,7 +202,12 @@ See [DEVELOPMENT_CHALLENGES.md](DEVELOPMENT_CHALLENGES.md) for detailed document
 ├── README.md                     # This file
 ├── DEVELOPMENT_CHALLENGES.md     # Development documentation
 ├── MarineInsightsTask.md         # Original requirements
-└── msin_notices.json             # Output file (generated)
+├── msin_notices.json             # Output file (generated)
+├── .scraper_state.json           # Progress state for incremental scraping (generated)
+└── pdfs/                         # Downloaded PDFs (generated)
+    ├── msin_01_2024_en.pdf
+    ├── msin_01_2024_cn.pdf
+    └── ...
 ```
 
 ## License
