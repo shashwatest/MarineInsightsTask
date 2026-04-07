@@ -39,10 +39,9 @@ class MSINScraper {
             ...options
         };
         
-        // Request queue for proper rate limiting
-        this.requestQueue = [];
-        this.activeRequests = 0;
+        // Rate limiting state - now concurrency-safe
         this.lastRequestTime = 0;
+        this.rateLimitLock = Promise.resolve();
         
         // State save throttling
         this.stateSaveTimeout = null;
@@ -74,9 +73,32 @@ class MSINScraper {
         }
     }
     
-    // Throttled state save - prevents write contention
+    // Throttled state save - prevents write contention (stores minimal data)
     async saveStateThrottled(state) {
-        this.pendingState = state;
+        // Create lightweight state without full_text to reduce file size
+        const lightweightState = {
+            processedNotices: {},
+            lastRun: state.lastRun
+        };
+        
+        // Store only essential metadata, not full content
+        for (const [noticeNumber, noticeData] of Object.entries(state.processedNotices)) {
+            lightweightState.processedNotices[noticeNumber] = {
+                status: noticeData.status,
+                processedAt: noticeData.processedAt,
+                error: noticeData.error,
+                // Store only minimal data for verification
+                metadata: noticeData.data ? {
+                    notice_number: noticeData.data.notice_number,
+                    title: noticeData.data.title,
+                    issue_date: noticeData.data.issue_date,
+                    pdf_url: noticeData.data.pdf_url,
+                    local_path: noticeData.data.local_path
+                } : null
+            };
+        }
+        
+        this.pendingState = lightweightState;
         
         if (this.stateSaveTimeout) {
             return; // Already scheduled
@@ -90,13 +112,37 @@ class MSINScraper {
         }, 1000); // Save at most once per second
     }
     
-    // Immediate state save (for final save)
+    // Immediate state save (for final save) - stores minimal data
     async saveState(state) {
         if (this.stateSaveTimeout) {
             clearTimeout(this.stateSaveTimeout);
             this.stateSaveTimeout = null;
         }
-        await fs.writeFile(this.stateFile, JSON.stringify(state, null, 2), 'utf8');
+        
+        // Create lightweight state without full_text to reduce file size
+        const lightweightState = {
+            processedNotices: {},
+            lastRun: state.lastRun
+        };
+        
+        // Store only essential metadata, not full content
+        for (const [noticeNumber, noticeData] of Object.entries(state.processedNotices)) {
+            lightweightState.processedNotices[noticeNumber] = {
+                status: noticeData.status,
+                processedAt: noticeData.processedAt,
+                error: noticeData.error,
+                // Store only minimal data for verification
+                metadata: noticeData.data ? {
+                    notice_number: noticeData.data.notice_number,
+                    title: noticeData.data.title,
+                    issue_date: noticeData.data.issue_date,
+                    pdf_url: noticeData.data.pdf_url,
+                    local_path: noticeData.data.local_path
+                } : null
+            };
+        }
+        
+        await fs.writeFile(this.stateFile, JSON.stringify(lightweightState, null, 2), 'utf8');
     }
     
     async clearState() {
@@ -113,17 +159,38 @@ class MSINScraper {
                state.processedNotices[noticeNumber].status === 'done';
     }
     
-    // Proper rate limiting - ensures minimum gap between ANY requests
-    async waitForRateLimit() {
-        const now = Date.now();
-        const timeSinceLastRequest = now - this.lastRequestTime;
-        const waitTime = Math.max(0, this.options.rateLimit - timeSinceLastRequest);
+    // Detect language from text content
+    detectLanguage(text) {
+        if (!text || text.trim().length === 0) return 'unknown';
         
-        if (waitTime > 0) {
-            await new Promise(resolve => setTimeout(resolve, waitTime));
+        // Count Chinese characters
+        const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+        const totalChars = text.replace(/\s/g, '').length;
+        
+        // If more than 30% Chinese characters, consider it Chinese
+        if (totalChars > 0 && (chineseChars / totalChars) > 0.3) {
+            return 'chinese';
         }
         
-        this.lastRequestTime = Date.now();
+        return 'english';
+    }
+    
+    // Proper rate limiting - ensures minimum gap between ANY requests (concurrency-safe)
+    async waitForRateLimit() {
+        // Chain requests to ensure they're serialized
+        this.rateLimitLock = this.rateLimitLock.then(async () => {
+            const now = Date.now();
+            const timeSinceLastRequest = now - this.lastRequestTime;
+            const waitTime = Math.max(0, this.options.rateLimit - timeSinceLastRequest);
+            
+            if (waitTime > 0) {
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+            }
+            
+            this.lastRequestTime = Date.now();
+        });
+        
+        await this.rateLimitLock;
     }
     
     // Process items with proper concurrency control
@@ -198,7 +265,7 @@ class MSINScraper {
     }
 
     async initBrowser() {
-        console.log('Initializing browser...');
+        this.log('Initializing browser...', 'debug');
         try {
             this.browser = await puppeteer.launch({
                 headless: 'new',
@@ -220,7 +287,7 @@ class MSINScraper {
             await this.page.setDefaultNavigationTimeout(60000);
             await this.page.setDefaultTimeout(60000);
         } catch (error) {
-            console.error('Failed to initialize browser:', error.message);
+            this.log(`Failed to initialize browser: ${error.message}`, 'error');
             throw error;
         }
     }
@@ -230,27 +297,27 @@ class MSINScraper {
             try {
                 await this.browser.close();
             } catch (error) {
-                console.error('Error closing browser:', error.message);
+                this.log(`Error closing browser: ${error.message}`, 'debug');
             }
         }
     }
 
     async scrapeIndexPage() {
-        console.log(`Fetching index page: ${this.baseUrl}`);
+        this.log(`Fetching index page: ${this.baseUrl}`);
         
         try {
             await this.initBrowser();
             await this.page.goto(this.baseUrl, { waitUntil: 'networkidle2', timeout: 60000 });
             
-            console.log('Waiting for page to load...');
-            await this.page.waitForTimeout(4000);
+            this.log('Waiting for page to load...');
+            await new Promise(resolve => setTimeout(resolve, 4000));
             
             const notices = [];
             let pageNum = 1;
-            const maxAttempts = 20;
+            const maxPages = 50; // Safety limit for pagination
             
-            while (pageNum <= maxAttempts) {
-                console.log(`Scraping page ${pageNum}...`);
+            while (pageNum <= maxPages) {
+                this.log(`Scraping page ${pageNum}...`);
                 
                 // Get page content
                 const pageNotices = await this.page.evaluate(() => {
@@ -333,7 +400,7 @@ class MSINScraper {
                     return results;
                 });
                 
-                console.log(`  Found ${pageNotices.length} notices on page ${pageNum}`);
+                this.log(`  Found ${pageNotices.length} notices on page ${pageNum}`);
                 notices.push(...pageNotices);
                 
                 // If no notices found, we've reached the end
@@ -347,15 +414,15 @@ class MSINScraper {
                     await this.page.evaluate((page) => {
                         whatsNewObj.goToPage(page);
                     }, nextPage);
-                    await this.page.waitForTimeout(3000);
+                    await new Promise(resolve => setTimeout(resolve, 3000));
                     pageNum = nextPage;
                 } catch (e) {
-                    console.log(`  Could not navigate to page ${pageNum + 1}: ${e.message}`);
+                    this.log(`  Could not navigate to page ${pageNum + 1}: ${e.message}`, 'debug');
                     break;
                 }
             }
             
-            console.log(`Found ${notices.length} total notices across ${pageNum} pages`);
+            this.log(`Found ${notices.length} total notices across ${pageNum} pages`);
             
             // Deduplicate by notice number (some notices might appear on multiple pages)
             const uniqueNotices = [];
@@ -368,7 +435,7 @@ class MSINScraper {
             }
             
             if (uniqueNotices.length < notices.length) {
-                console.log(`Deduplicated to ${uniqueNotices.length} unique notices`);
+                this.log(`Deduplicated to ${uniqueNotices.length} unique notices`);
             }
             
             return uniqueNotices;
@@ -423,6 +490,63 @@ class MSINScraper {
         throw lastError;
     }
 
+    async renderPdfPage(pageData) {
+        const renderOptions = {
+            normalizeWhitespace: false,
+            disableCombineTextItems: false
+        };
+
+        const textContent = await pageData.getTextContent(renderOptions);
+        let lastY;
+        let text = '';
+
+        for (const item of textContent.items) {
+            if (lastY === item.transform[5] || lastY == null) {
+                text += item.str;
+            } else {
+                text += '\n' + item.str;
+            }
+
+            lastY = item.transform[5];
+        }
+
+        return text;
+    }
+
+    async extractTextByPage(pdfBuffer) {
+        const rawPageTexts = [];
+        const data = await pdf(pdfBuffer, {
+            pagerender: async (pageData) => {
+                try {
+                    const rawText = await this.renderPdfPage(pageData);
+                    rawPageTexts.push(rawText);
+                    return rawText;
+                } catch (error) {
+                    this.log(`  Page text extraction failed: ${error.message}`, 'debug');
+                    rawPageTexts.push('');
+                    return '';
+                }
+            }
+        });
+
+        const pageCount = data.numpages || rawPageTexts.length;
+        while (rawPageTexts.length < pageCount) {
+            rawPageTexts.push('');
+        }
+
+        const pages = rawPageTexts.map((rawText, index) => ({
+            page: index + 1,
+            text: this.cleanText(rawText)
+        }));
+
+        return {
+            data,
+            pageCount,
+            pages,
+            fullText: this.cleanText(data.text || rawPageTexts.join('\n\n'))
+        };
+    }
+
     async downloadAndParsePdf(pdfUrl, options = {}) {
         let worker = null;
         const { silent = false } = options; // Don't log errors or track failures when silent
@@ -432,25 +556,33 @@ class MSINScraper {
             
             const response = await this.downloadWithRetry(pdfUrl);
             const pdfBuffer = Buffer.from(response.data);
-            const data = await pdf(pdfBuffer);
+            const extractedText = await this.extractTextByPage(pdfBuffer);
             
-            const pageCount = data.numpages || 0;
-            let fullText = this.cleanText(data.text);
+            const pageCount = extractedText.pageCount || 0;
+            let fullText = extractedText.fullText;
             const originalText = fullText; // Keep original text as backup
-            let pages = []; // Will store page-by-page data
+            const originalPages = extractedText.pages;
+            let pages = originalPages;
+            
+            // Detect language from extracted text
+            const detectedLang = this.detectLanguage(fullText);
             
             // Check if text extraction is poor (likely scanned PDF)
-            const textIsSparse = !fullText || fullText.trim().length < 100;
+            // Use language-specific thresholds (Chinese is more information-dense)
+            const threshold = detectedLang === 'chinese' ? 50 : 100;
+            const textIsSparse = !fullText || fullText.trim().length < threshold;
             
             if (textIsSparse) {
-                console.log('  PDF appears to be scanned or has sparse text - performing OCR...');
-                console.log(`  Original text length: ${originalText ? originalText.length : 0} chars`);
+                this.log('  PDF appears to be scanned or has sparse text - performing OCR...');
+                this.log(`  Original text length: ${originalText ? originalText.length : 0} chars`, 'debug');
+                this.log(`  Detected language: ${detectedLang}`, 'debug');
                 
-                // Initialize Tesseract worker with better settings
-                worker = await createWorker('eng+chi_tra+chi_sim', 1, {
+                // Initialize Tesseract worker with language-specific models
+                const ocrLangs = detectedLang === 'chinese' ? 'chi_tra+chi_sim' : 'eng+chi_tra+chi_sim';
+                worker = await createWorker(ocrLangs, 1, {
                     logger: m => {
                         if (m.status === 'recognizing text') {
-                            console.log(`    Tesseract progress: ${Math.round(m.progress * 100)}%`);
+                            this.log(`    Tesseract progress: ${Math.round(m.progress * 100)}%`);
                         }
                     }
                 });
@@ -461,19 +593,19 @@ class MSINScraper {
                 if (ocrResult.fullText && ocrResult.fullText.trim().length > 50) {
                     fullText = ocrResult.fullText;
                     pages = ocrResult.pages;
-                    console.log(`  OCR successful: extracted ${fullText.length} characters`);
+                    this.log(`  OCR successful: extracted ${fullText.length} characters`);
                 } else {
-                    console.log(`  OCR returned minimal text (${ocrResult.fullText ? ocrResult.fullText.length : 0} chars)`);
+                    this.log(`  OCR returned minimal text (${ocrResult.fullText ? ocrResult.fullText.length : 0} chars)`, 'debug');
                     // Keep original text if OCR failed
                     if (!ocrResult.fullText || ocrResult.fullText.trim().length === 0) {
                         if (originalText && originalText.trim().length > 0) {
-                            console.log(`  Keeping original text (${originalText.length} chars)`);
+                            this.log(`  Keeping original text (${originalText.length} chars)`, 'debug');
                             fullText = originalText;
-                            pages = this.splitIntoPages(fullText, pageCount);
+                            pages = originalPages;
                         } else {
-                            console.log(`  WARNING: Both OCR and text extraction failed`);
+                            this.log(`  WARNING: Both OCR and text extraction failed`);
                             fullText = ocrResult.fullText || originalText || '';
-                            pages = ocrResult.pages.length > 0 ? ocrResult.pages : this.splitIntoPages(fullText, pageCount);
+                            pages = ocrResult.pages.length > 0 ? ocrResult.pages : originalPages;
                         }
                     } else {
                         fullText = ocrResult.fullText;
@@ -485,11 +617,12 @@ class MSINScraper {
                 const hasImages = await this.pdfHasImages(pdfBuffer);
                 
                 if (hasImages) {
-                    console.log('  PDF contains images - performing OCR on images...');
-                    worker = await createWorker('eng+chi_tra+chi_sim', 1, {
+                    this.log('  PDF contains images - performing OCR on images...');
+                    const ocrLangs = detectedLang === 'chinese' ? 'chi_tra+chi_sim' : 'eng+chi_tra+chi_sim';
+                    worker = await createWorker(ocrLangs, 1, {
                         logger: m => {
                             if (m.status === 'recognizing text') {
-                                console.log(`    Tesseract progress: ${Math.round(m.progress * 100)}%`);
+                                this.log(`    Tesseract progress: ${Math.round(m.progress * 100)}%`);
                             }
                         }
                     });
@@ -497,16 +630,13 @@ class MSINScraper {
                     
                     if (ocrResult.fullText && ocrResult.fullText.trim().length > 50) {
                         fullText += '\n\n[OCR from embedded images]\n' + ocrResult.fullText;
-                        console.log(`  OCR from images: extracted ${ocrResult.fullText.length} characters`);
+                        this.log(`  OCR from images: extracted ${ocrResult.fullText.length} characters`);
                     }
                 }
-                
-                // For normal PDFs, split text into pages
-                pages = this.splitIntoPages(fullText, pageCount);
             }
             
             if (!fullText || fullText.trim().length === 0) {
-                console.log('  WARNING: No text extracted - PDF may be corrupted or unreadable');
+                this.log('  WARNING: No text extracted - PDF may be corrupted or unreadable');
                 // Don't throw error, just flag it
                 fullText = '[No text could be extracted from this PDF - manual review required]';
                 pages = [{
@@ -516,19 +646,19 @@ class MSINScraper {
             }
             
             if (fullText.trim().length < 50 && fullText.trim().length > 0) {
-                console.log(`  WARNING: Very little text extracted (${fullText.trim().length} chars)`);
+                this.log(`  WARNING: Very little text extracted (${fullText.trim().length} chars)`);
             }
             
             // Ensure we have pages data
             if (!pages || pages.length === 0) {
-                pages = this.splitIntoPages(fullText, pageCount);
+                pages = originalPages.length > 0 ? originalPages : this.splitIntoPages(fullText, pageCount);
             }
             
-            // Extract metadata from PDF content
-            const subject = this.extractSubject(fullText);
-            const issuedBy = this.extractIssuedBy(fullText);
-            const effectiveDate = this.extractEffectiveDate(fullText);
-            const summary = this.extractSummary(fullText);
+            // Extract metadata from PDF content (language-aware)
+            const subject = this.extractSubject(fullText, detectedLang);
+            const issuedBy = this.extractIssuedBy(fullText, detectedLang);
+            const effectiveDate = this.extractEffectiveDate(fullText, detectedLang);
+            const summary = this.extractSummary(fullText, detectedLang);
             
             // Extract tables from PDF text
             let tables = [];
@@ -556,7 +686,7 @@ class MSINScraper {
             
         } catch (error) {
             if (!silent) {
-                console.error(`ERROR: Failed to process PDF ${pdfUrl}: ${error.message}`);
+                this.log(`ERROR: Failed to process PDF ${pdfUrl}: ${error.message}`, 'error');
                 this.failedPdfs.push({ url: pdfUrl, error: error.message });
             }
             return null;
@@ -583,7 +713,7 @@ class MSINScraper {
             
             return false;
         } catch (error) {
-            console.log('  Could not check for images:', error.message);
+            this.log('  Could not check for images: ' + error.message, 'debug');
             return false;
         }
     }
@@ -597,7 +727,7 @@ class MSINScraper {
             tempPdfPath = path.join(process.cwd(), `temp_ocr_${timestamp}_${pageNumber}.pdf`);
             await fs.writeFile(tempPdfPath, pdfBuffer);
             
-            console.log(`    Converting page ${pageNumber} to image...`);
+            this.log(`    Converting page ${pageNumber} to image...`, 'debug');
             
             // Convert specific page to PNG - use relative path for output
             const pngPages = await pdfToPng(tempPdfPath, {
@@ -611,11 +741,11 @@ class MSINScraper {
                 pdfFilePassword: ''
             });
             
-            console.log(`    Conversion result: ${pngPages ? pngPages.length : 0} images generated`);
+            this.log(`    Conversion result: ${pngPages ? pngPages.length : 0} images generated`, 'debug');
             
             if (pngPages && pngPages.length > 0 && pngPages[0].content) {
                 const imageBuffer = pngPages[0].content;
-                console.log(`    Image buffer size: ${imageBuffer.length} bytes`);
+                this.log(`    Image buffer size: ${imageBuffer.length} bytes`, 'debug');
                 
                 // Clean up generated PNG file if it exists
                 if (pngPages[0].path && fsSync.existsSync(pngPages[0].path)) {
@@ -625,11 +755,11 @@ class MSINScraper {
                 return imageBuffer;
             }
             
-            console.log(`    No image generated for page ${pageNumber}`);
+            this.log(`    No image generated for page ${pageNumber}`, 'debug');
             return null;
             
         } catch (error) {
-            console.log(`    Error converting page ${pageNumber} to image:`, error.message);
+            this.log(`    Error converting page ${pageNumber} to image: ${error.message}`, 'debug');
             return null;
         } finally {
             // Clean up temp PDF
@@ -646,14 +776,14 @@ class MSINScraper {
             let successfulPages = 0;
             
             for (let i = 1; i <= pageCount; i++) {
-                console.log(`    OCR processing page ${i}/${pageCount}...`);
+                this.log(`    OCR processing page ${i}/${pageCount}...`, 'debug');
                 
                 try {
                     // Convert PDF page to image
                     const imageBuffer = await this.convertPdfPageToImage(pdfBuffer, i);
                     
                     if (!imageBuffer) {
-                        console.log(`    Skipping page ${i} - conversion failed`);
+                        this.log(`    Skipping page ${i} - conversion failed`, 'debug');
                         // Add empty page to maintain page numbers
                         pagesData.push({
                             page: i,
@@ -662,13 +792,13 @@ class MSINScraper {
                         continue;
                     }
                     
-                    console.log(`    Image buffer size: ${imageBuffer.length} bytes`);
+                    this.log(`    Image buffer size: ${imageBuffer.length} bytes`, 'debug');
                     
                     // Perform OCR on the image
                     const result = await worker.recognize(imageBuffer);
                     const text = result.data.text;
                     
-                    console.log(`    OCR extracted ${text ? text.length : 0} characters`);
+                    this.log(`    OCR extracted ${text ? text.length : 0} characters`, 'debug');
                     
                     if (text && text.trim().length > 10) {
                         const cleanedText = text.trim();
@@ -679,14 +809,14 @@ class MSINScraper {
                         ocrTexts.push(cleanedText);
                         successfulPages++;
                     } else {
-                        console.log(`    Page ${i} OCR returned minimal text`);
+                        this.log(`    Page ${i} OCR returned minimal text`, 'debug');
                         pagesData.push({
                             page: i,
                             text: text ? text.trim() : '[No text on this page]'
                         });
                     }
                 } catch (pageError) {
-                    console.log(`    OCR failed for page ${i}: ${pageError.message}`);
+                    this.log(`    OCR failed for page ${i}: ${pageError.message}`, 'debug');
                     pagesData.push({
                         page: i,
                         text: '[OCR failed for this page]'
@@ -694,10 +824,10 @@ class MSINScraper {
                 }
             }
             
-            console.log(`  OCR completed: ${successfulPages}/${pageCount} pages successful`);
+            this.log(`  OCR completed: ${successfulPages}/${pageCount} pages successful`, 'debug');
             
             if (ocrTexts.length === 0) {
-                console.log('  WARNING: No text extracted from any page');
+                this.log('  WARNING: No text extracted from any page', 'debug');
             }
             
             return {
@@ -705,7 +835,7 @@ class MSINScraper {
                 pages: pagesData
             };
         } catch (error) {
-            console.log('  Full PDF OCR failed:', error.message);
+            this.log('  Full PDF OCR failed: ' + error.message, 'debug');
             return {
                 fullText: '',
                 pages: []
@@ -718,7 +848,7 @@ class MSINScraper {
             // Similar to ocrEntirePdf - OCR each page individually
             return await this.ocrEntirePdf(pdfBuffer, worker, pageCount);
         } catch (error) {
-            console.log('  Image OCR failed:', error.message);
+            this.log('  Image OCR failed: ' + error.message, 'debug');
             return {
                 fullText: '',
                 pages: []
@@ -737,7 +867,7 @@ class MSINScraper {
             );
             
             if (tempFiles.length > 0) {
-                console.log(`\nCleaning up ${tempFiles.length} temporary files...`);
+                this.log(`\nCleaning up ${tempFiles.length} temporary files...`);
                 for (const file of tempFiles) {
                     try {
                         await fs.unlink(path.join(currentDir, file));
@@ -764,8 +894,7 @@ class MSINScraper {
     }
 
     splitIntoPages(fullText, pageCount) {
-        // Since pdf-parse doesn't provide page-by-page text, we'll estimate
-        // by splitting the text into roughly equal parts
+        // Legacy fallback only when direct page extraction fails unexpectedly.
         const pages = [];
         
         if (!fullText || pageCount === 0) {
@@ -791,7 +920,7 @@ class MSINScraper {
         return pages;
     }
 
-    extractSubject(text) {
+    extractSubject(text, language = 'english') {
         const lines = text.split('\n');
         
         // Strategy 1: Standard format with "INFORMATION NOTE" header
@@ -801,24 +930,39 @@ class MSINScraper {
         let infoNoteIndex = -1;
         let toLineIndex = -1;
         
+        // Language-specific patterns
+        const isChineseDoc = language === 'chinese';
+        const toPattern = isChineseDoc ? /^致\s*[：:]/i : /^To\s*:/i;
+        const englishHeaderPattern = /HONG KONG MERCHANT SHIPPING INFORMATION NOTE\s*$/i;
+        const chineseHeaderPattern = /香\s*港\s*商\s*船\s*資\s*訊\s*$/i;
+        
         // First pass: Find "INFORMATION NOTE" header and "To:" line
-        // Prioritize English header over Chinese header
-        // Handle OCR noise (e.g., "人 S HONG KONG MERCHANT SHIPPING...")
+        // Prioritize language-appropriate header
         for (let i = 0; i < lines.length; i++) {
             const lineStripped = lines[i].trim();
             
-            // Find English "INFORMATION NOTE" header first (higher priority)
-            // Allow for OCR noise before the header
-            if (infoNoteIndex === -1 && /HONG KONG MERCHANT SHIPPING INFORMATION NOTE\s*$/i.test(lineStripped)) {
-                infoNoteIndex = i;
-            }
-            // If no English header found yet, accept Chinese header
-            else if (infoNoteIndex === -1 && /香\s*港\s*商\s*船\s*資\s*訊\s*$/i.test(lineStripped)) {
-                infoNoteIndex = i;
+            if (isChineseDoc) {
+                // For Chinese docs, prioritize Chinese header
+                if (infoNoteIndex === -1 && chineseHeaderPattern.test(lineStripped)) {
+                    infoNoteIndex = i;
+                }
+                // Accept English header as fallback
+                else if (infoNoteIndex === -1 && englishHeaderPattern.test(lineStripped)) {
+                    infoNoteIndex = i;
+                }
+            } else {
+                // For English docs, prioritize English header
+                if (infoNoteIndex === -1 && englishHeaderPattern.test(lineStripped)) {
+                    infoNoteIndex = i;
+                }
+                // Accept Chinese header as fallback
+                else if (infoNoteIndex === -1 && chineseHeaderPattern.test(lineStripped)) {
+                    infoNoteIndex = i;
+                }
             }
             
-            // Find "To:" line (or "To :" with space)
-            if (/^To\s*:/i.test(lineStripped)) {
+            // Find "To:" or "致：" line
+            if (toPattern.test(lineStripped)) {
                 toLineIndex = i;
                 break;
             }
@@ -834,10 +978,10 @@ class MSINScraper {
                 if (!lineStripped) continue;
                 
                 // Skip the English header if it appears after Chinese header (with or without OCR noise)
-                if (/HONG KONG MERCHANT SHIPPING INFORMATION NOTE\s*$/i.test(lineStripped)) continue;
+                if (englishHeaderPattern.test(lineStripped)) continue;
                 
                 // Skip the Chinese header if it appears again
-                if (/^香\s*港\s*商\s*船\s*資\s*訊\s*$/i.test(lineStripped)) continue;
+                if (chineseHeaderPattern.test(lineStripped)) continue;
                 
                 // Skip standalone MSIN number lines
                 if (/^MSIN\s+No\.\s*\d+\/\d{4}$/i.test(lineStripped)) continue;
@@ -845,8 +989,8 @@ class MSINScraper {
                 // Skip standalone date patterns like "1/2026"
                 if (/^\d+\/\d{4}$/i.test(lineStripped)) continue;
                 
-                // Skip "No. :" or "No:" lines
-                if (/^No\.?\s*:\s*$/i.test(lineStripped)) continue;
+                // Skip "No. :" or "No:" or "編號 :" lines
+                if (/^(No\.?\s*[：:]|編號\s*[：:])\s*$/i.test(lineStripped)) continue;
                 
                 // Skip lines that are just OCR noise (single characters, symbols)
                 if (/^[^\w\s]{1,3}$/.test(lineStripped)) continue;
@@ -877,8 +1021,8 @@ class MSINScraper {
                     continue;
                 }
                 
-                // Check if this looks like metadata (contact info, addresses)
-                const isMetadata = /^(Marine Department|Harbour Building|Pier Road|G\.P\.O\.|Box \d+|Hong Kong|Telephone|Fax|E-mail|Web site|https?:\/\/|No\.?\s*:|MSIN\s+No\.|^\d+\/\d{4}$|香港商船資訊)/i.test(lineStripped);
+                // Check if this looks like metadata (contact info, addresses) - both English and Chinese
+                const isMetadata = /^(Marine Department|Harbour Building|Pier Road|G\.P\.O\.|Box \d+|Hong Kong|Telephone|Fax|E-mail|Web site|https?:\/\/|No\.?\s*[：:]|MSIN\s+No\.|^\d+\/\d{4}$|香港商船資訊|海事處|統一碼頭道|香港郵政總局|電話|傳真|電郵|網站|編號)/i.test(lineStripped);
                 
                 if (isMetadata) {
                     // We've hit metadata, so subject starts after this block
@@ -916,12 +1060,28 @@ class MSINScraper {
         return 'Not specified';
     }
 
-    extractIssuedBy(text) {
-        const patterns = [
+    extractIssuedBy(text, language = 'english') {
+        const isChineseDoc = language === 'chinese';
+        
+        // Language-specific patterns
+        const patterns = isChineseDoc ? [
+            /海事處處長/i,
+            /海事處/i,
+            /簽署\s*[：:]\s*([^\n]+)/i,
+            /發出\s*[：:]\s*([^\n]+)/i,
+            // Fallback to English patterns
             /Director of Marine/i,
             /Marine Department/i,
             /Issued by[:\s]+([^\n]+)/i,
             /Signed[:\s]+([^\n]+)/i
+        ] : [
+            /Director of Marine/i,
+            /Marine Department/i,
+            /Issued by[:\s]+([^\n]+)/i,
+            /Signed[:\s]+([^\n]+)/i,
+            // Fallback to Chinese patterns
+            /海事處處長/i,
+            /海事處/i
         ];
         
         for (const pattern of patterns) {
@@ -934,17 +1094,43 @@ class MSINScraper {
         return 'Not specified';
     }
 
-    extractEffectiveDate(text) {
-        const patterns = [
+    extractEffectiveDate(text, language = 'english') {
+        const isChineseDoc = language === 'chinese';
+        
+        // Language-specific patterns
+        const patterns = isChineseDoc ? [
+            // Chinese date patterns
+            /生效日期\s*[：:]\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/i,
+            /由\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*生效/i,
+            /生效\s*[：:]\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/i,
+            // Fallback to Western format
+            /生效日期\s*[：:]\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i,
             /Effective\s+(?:date|from)[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i,
             /Effective[:\s]+(\d{1,2}\s+\w+\s+\d{4})/i,
             /With effect from[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i
+        ] : [
+            // English date patterns
+            /Effective\s+(?:date|from)[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i,
+            /Effective[:\s]+(\d{1,2}\s+\w+\s+\d{4})/i,
+            /With effect from[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i,
+            // Fallback to Chinese format
+            /生效日期\s*[：:]\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/i,
+            /由\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*生效/i
         ];
         
         for (const pattern of patterns) {
             const match = text.match(pattern);
             if (match) {
                 try {
+                    // Handle Chinese date format (YYYY年MM月DD日)
+                    if (match.length === 4 && match[1] && match[2] && match[3]) {
+                        const year = match[1];
+                        const month = String(match[2]).padStart(2, '0');
+                        const day = String(match[3]).padStart(2, '0');
+                        return `${year}-${month}-${day}`;
+                    }
+                    
+                    // Handle Western date format
                     const parsed = new Date(match[1]);
                     if (!isNaN(parsed.getTime())) {
                         // Use local date components to avoid timezone issues
@@ -962,28 +1148,42 @@ class MSINScraper {
         return 'Not specified';
     }
 
-    extractSummary(text) {
+    extractSummary(text, language = 'english') {
         const lines = text.split('\n');
         const summaryLines = [];
         let inSummary = false;
         
+        const isChineseDoc = language === 'chinese';
+        
+        // Language-specific patterns
+        const summaryHeaderPattern = isChineseDoc ? /^(概要|摘要|Summary)\s*$/i : /^(Summary|概要|摘要)\s*$/i;
+        const stopPatterns = isChineseDoc ? [
+            /^\d+\s*[.．、]/,  // Chinese numbered sections
+            /^(背景|目的|引言|事件經過|經驗教訓|附件|Background|Purpose|Introduction|The Incident|Lessons Learnt)/i
+        ] : [
+            /^\d+\./,  // English numbered sections
+            /^(Background|Purpose|Introduction|The Incident|Lessons Learnt|背景|事件經過|經驗教訓)/i
+        ];
+        
         for (let i = 0; i < lines.length; i++) {
             const lineStripped = lines[i].trim();
             
-            // Start capturing when we find "Summary" header
-            if (/^Summary\s*$/i.test(lineStripped)) {
+            // Start capturing when we find "Summary" or "概要" header
+            if (summaryHeaderPattern.test(lineStripped)) {
                 inSummary = true;
                 continue;
             }
             
             if (inSummary) {
-                // Stop at numbered sections (1., 2., etc.) or other major headers
-                if (/^\d+\./.test(lineStripped)) {
-                    break;
+                // Stop at numbered sections or other major headers
+                let shouldStop = false;
+                for (const stopPattern of stopPatterns) {
+                    if (stopPattern.test(lineStripped)) {
+                        shouldStop = true;
+                        break;
+                    }
                 }
-                if (/^(Background|Purpose|Introduction|The Incident|Lessons Learnt)/i.test(lineStripped)) {
-                    break;
-                }
+                if (shouldStop) break;
                 
                 // Skip empty lines at the start
                 if (summaryLines.length === 0 && !lineStripped) {
@@ -1012,17 +1212,22 @@ class MSINScraper {
         const bodyLines = [];
         let foundContent = false;
         
+        // Language-specific metadata patterns
+        const metadataPattern = isChineseDoc ? 
+            /^(香港商船資訊|HONG KONG MERCHANT SHIPPING|MSIN No\.|編號\s*[：:]|致\s*[：:]|海事處|統一碼頭道|香港郵政總局|To\s*:|Marine Department|Harbour Building)/i :
+            /^(HONG KONG MERCHANT SHIPPING|香港商船資訊|MSIN No\.|No\.\s*:|To\s*:|Marine Department|Harbour Building)/i;
+        
         for (const line of lines) {
             const lineStripped = line.trim();
             if (!lineStripped) continue;
             
             // Skip common header/metadata patterns
-            if (/^(HONG KONG MERCHANT SHIPPING|香港商船資訊|MSIN No\.|No\.\s*:|To\s*:|Marine Department|Harbour Building)/i.test(lineStripped)) {
+            if (metadataPattern.test(lineStripped)) {
                 continue;
             }
             
             // Start capturing after we see numbered sections or substantive content
-            if (/^[1-9]\./.test(lineStripped) || lineStripped.length > 50) {
+            if (/^[1-9][\s.．、]/.test(lineStripped) || lineStripped.length > 50) {
                 foundContent = true;
             }
             
@@ -1040,7 +1245,11 @@ class MSINScraper {
             
             // Find a good break point between 500-1000 chars
             let endPos = 1000;
-            const sentenceEnd = bodyText.lastIndexOf('.', 1000);
+            // For Chinese, look for Chinese period (。) or English period
+            const sentenceEnd = isChineseDoc ? 
+                Math.max(bodyText.lastIndexOf('。', 1000), bodyText.lastIndexOf('.', 1000)) :
+                bodyText.lastIndexOf('.', 1000);
+            
             if (sentenceEnd > 500) {
                 endPos = sentenceEnd + 1;
             }
