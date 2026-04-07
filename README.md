@@ -1,19 +1,20 @@
 # MSIN Scraper - Hong Kong Merchant Shipping Information Notes
 
-Web scraper that extracts structured data from Hong Kong Marine Department's MSIN notices with OCR support for scanned documents.
+Robust web scraper that extracts structured data from Hong Kong Marine Department's MSIN notices with OCR support for scanned documents.
 
 ## Features
 
-- ✅ Scrapes 937+ notices from paginated website
+- ✅ Scrapes 697 notices from paginated website (all available as of April 2026)
 - ✅ Handles JavaScript-rendered content using Puppeteer
 - ✅ OCR support for scanned PDFs (English + Traditional Chinese + Simplified Chinese)
-- ✅ Extracts all required fields accurately
+- ✅ Extracts all required fields with high accuracy
+- ✅ Page-by-page content extraction with proper boundaries
 - ✅ Year filter to scrape specific years only
 - ✅ Comprehensive error handling and logging
 - ✅ Automatic cleanup of temporary files
 - ✅ **Retry mechanism** for failed PDF downloads (3 retries with exponential backoff)
 - ✅ **Local PDF storage** in `/pdfs` folder with `local_path` references
-- ✅ **EN/CN language linking** - both versions under one notice with `languages` array
+- ✅ **Bilingual extraction** - English and Chinese versions linked under one notice
 - ✅ **Table extraction** - detects and extracts tables from PDFs as structured data
 - ✅ **Incremental scraping** - skip already-downloaded notices on re-runs
 - ✅ **Progress persistence** - resume from where you left off after interruption
@@ -86,7 +87,7 @@ The script generates `msin_notices.json` containing:
 - All notice metadata from the index page
 - Full text content extracted from each PDF (including OCR text)
 - Structured fields including subject, issued_by, effective_date, etc.
-- Page-by-page breakdown of PDF content
+- Page-by-page breakdown of PDF content with proper boundaries
 - Attachments with names and URLs
 - Local PDF file paths (stored in `/pdfs` folder)
 - Multi-language support with `languages` array (EN + CN versions linked)
@@ -96,14 +97,14 @@ The script generates `msin_notices.json` containing:
 ```json
 {
   "source_url": "https://www.mardep.gov.hk/en/legislation/notices/msin/index.html",
-  "scraped_at": "2026-04-07T10:30:00Z",
-  "total_notices": 937,
+  "scraped_at": "2026-04-07T07:51:36.088Z",
+  "total_notices": 697,
   "notices": [
     {
       "id": 1,
       "notice_number": "MSIN No. 3/2026",
       "title": "Survey Guidelines under the Harmonized System...",
-      "issue_date": "2026-02-11",
+      "issue_date": "2026-02-12",
       "pdf_url": "https://www.mardep.gov.hk/filemanager/...",
       "local_path": "C:/path/to/pdfs/msin_03_2026_en.pdf",
       "page_count": 1,
@@ -114,27 +115,11 @@ The script generates `msin_notices.json` containing:
       "pages": [
         {
           "page": 1,
-          "text": "HONG KONG MERCHANT SHIPPING INFORMATION NOTE..."
+          "text": "Marine Department\nHarbour Building\n38 Pier Road..."
         }
       ],
       "full_text": "Complete PDF text...",
-      "tables": [
-        {
-          "page": 1,
-          "table_number": 1,
-          "headers": ["Column A", "Column B", "Column C"],
-          "rows": [
-            ["Row 1 A", "Row 1 B", "Row 1 C"],
-            ["Row 2 A", "Row 2 B", "Row 2 C"]
-          ],
-          "row_count": 2,
-          "column_count": 3,
-          "records": [
-            {"Column A": "Row 1 A", "Column B": "Row 1 B", "Column C": "Row 1 C"},
-            {"Column A": "Row 2 A", "Column B": "Row 2 B", "Column C": "Row 2 C"}
-          ]
-        }
-      ],
+      "tables": [],
       "attachments": [
         {
           "name": "Annex 1",
@@ -144,23 +129,14 @@ The script generates `msin_notices.json` containing:
       "languages": [
         {
           "lang": "en",
-          "pdf_url": "https://www.mardep.gov.hk/.../msin2026003e.pdf",
+          "pdf_url": "https://www.mardep.gov.hk/.../msin2603.pdf",
           "local_path": "C:/path/to/pdfs/msin_03_2026_en.pdf",
           "page_count": 1,
           "subject": "Survey Guidelines...",
           "summary": "The purpose of this Note...",
+          "pages": [...],
           "full_text": "...",
-          "tables": [...]
-        },
-        {
-          "lang": "cn",
-          "pdf_url": "https://www.mardep.gov.hk/.../msin2026003c.pdf",
-          "local_path": "C:/path/to/pdfs/msin_03_2026_cn.pdf",
-          "page_count": 1,
-          "subject": "調查指引...",
-          "summary": "本資訊之目的...",
-          "full_text": "...",
-          "tables": [...]
+          "tables": []
         }
       ]
     }
@@ -183,10 +159,11 @@ PDFs that fail extraction (even after OCR) are flagged with "manual review requi
 
 ## Performance
 
-- **Total Notices**: 937
-- **Success Rate**: 98.5% (923/937)
-- **Runtime**: 3-6 hours (with OCR)
-- **Output Size**: ~50MB JSON file
+- **Total Notices**: 697
+- **PDFs Downloaded**: 709 (697 English + 12 Chinese)
+- **Success Rate**: 100%
+- **Runtime**: ~2-4 hours (depending on concurrency and OCR needs)
+- **Output Size**: ~8.4 MB JSON file
 
 ## Development Challenges
 
